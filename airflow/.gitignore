@@ -1,2 +1,9 @@
 .env
+*.zip
+out.json
+have.txt
+want.txt
+.venv/
+__pycache__/
+airflow/logs/
 requirements.txt

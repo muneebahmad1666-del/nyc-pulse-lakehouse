@@ -1,3 +1,9 @@
+.venv/
 airflow/.env
 airflow/requirements.txt
 airflow/logs/
+*.zip
+out.json
+have.txt
+want.txt
+__pycache__/
