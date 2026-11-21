@@ -12,7 +12,6 @@ import pytest
 pytest.importorskip("pyspark")
 
 import nyc_ingest as bi  # noqa: E402
-
 B = "s3://test-bucket"
 
 
