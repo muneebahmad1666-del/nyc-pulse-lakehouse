@@ -43,8 +43,17 @@ except NameError:  # notebooks have no __file__
 import nyc_lib as lib
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    LongType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
+)
 
-DEFAULT_BUCKET = os.environ.get("NYC_BUCKET", "tb-scale-lakehouse-852824353987-us-east-1-an")
+DEFAULT_BUCKET = os.environ.get(
+    "NYC_BUCKET", "tb-scale-lakehouse-852824353987-us-east-1-an"
+)
 TLC_TYPES = ["yellow", "green", "fhv", "fhvhv"]
 TABLE = {
     "311": "nyc311_raw",
@@ -54,6 +63,14 @@ TABLE = {
     **{f"tlc_{t}": f"tlc_{t}_raw" for t in TLC_TYPES},
 }
 CSV_OPTIONS = {"header": "true", "inferSchema": "false", "quote": '"', "escape": '"'}
+_SPARK_TYPES = {
+    "string": StringType(),
+    "long": LongType(),
+    "timestamp": TimestampType(),
+}
+LOG_SCHEMA = StructType(
+    [StructField(n, _SPARK_TYPES[k], True) for n, k in lib.LOG_FIELDS]
+)
 
 
 # ----------------------------------------------------------------------------- context
@@ -100,7 +117,7 @@ def safe_ls(dbutils, path):
     """dbutils.fs.ls, but a missing folder gives []. Other errors are raised."""
     try:
         return dbutils.fs.ls(path)
-    except Exception as e:  # noqa: BLE001 - a missing folder is normal, anything else is raised
+    except Exception as e:
         text = str(e)
         if "FileNotFound" in text or "does not exist" in text or "NOT_FOUND" in text:
             return []
@@ -110,7 +127,10 @@ def safe_ls(dbutils, path):
 def days_present(ctx, folder):
     """Every day that has a folder under raw/<folder>/ (one listing, cached)."""
     if folder not in ctx.day_cache:
-        found = (lib.parse_day_dir(e.name) for e in safe_ls(ctx.dbutils, f"{ctx.raw}/{folder}/"))
+        found = (
+            lib.parse_day_dir(e.name)
+            for e in safe_ls(ctx.dbutils, f"{ctx.raw}/{folder}/")
+        )
         ctx.day_cache[folder] = sorted(d for d in found if d)
     return ctx.day_cache[folder]
 
@@ -151,7 +171,12 @@ def union_by_name(frames):
 def with_day_meta(df):
     """_day and _month come from the day=... folder in the file path."""
     return (
-        df.withColumn("_day", F.to_date(F.regexp_extract("_source_file", r"/day=(\d{4}-\d{2}-\d{2})/", 1)))
+        df.withColumn(
+            "_day",
+            F.to_date(
+                F.regexp_extract("_source_file", r"/day=(\d{4}-\d{2}-\d{2})/", 1)
+            ),
+        )
         .withColumn("_month", F.date_format("_day", "yyyy-MM"))
         .withColumn("_ingested_at", F.current_timestamp())
     )
@@ -173,19 +198,40 @@ def write_window(ctx, key, df, predicate):
     from delta.tables import DeltaTable
 
     path = ctx.table_path(key)
-    writer = df.write.format("delta").option("mergeSchema", "true").partitionBy("_month")
+    writer = (
+        df.write.format("delta").option("mergeSchema", "true").partitionBy("_month")
+    )
     if DeltaTable.isDeltaTable(ctx.spark, path):
         writer.mode("overwrite").option("replaceWhere", predicate).save(path)
     else:
         writer.mode("append").save(path)
     if ctx.register:
-        ctx.spark.sql(f"CREATE TABLE IF NOT EXISTS {ctx.catalog}.bronze.{TABLE[key]} USING DELTA LOCATION '{path}'")
+        ctx.spark.sql(
+            f"CREATE TABLE IF NOT EXISTS {ctx.catalog}.bronze.{TABLE[key]} USING DELTA LOCATION '{path}'"
+        )
     return ctx.spark.read.format("delta").load(path).where(predicate).count()
 
 
 def log_run(ctx, record):
-    row = {k: (str(v) if isinstance(v, date) and not isinstance(v, datetime) else v) for k, v in record.items()}
-    ctx.spark.createDataFrame([row]).write.format("delta").mode("append").option("mergeSchema", "true").save(ctx.log_path)
+    """Append one line to the run log. The schema is explicit, so None values are fine."""
+    row = lib.log_tuple(record)
+    (
+        ctx.spark.createDataFrame([row], schema=LOG_SCHEMA)
+        .write.format("delta")
+        .mode("append")
+        .option("mergeSchema", "true")
+        .save(ctx.log_path)
+    )
+
+
+def safe_log(ctx, record):
+    """A problem with the run log must not undo or fail ingestion that already succeeded."""
+    try:
+        log_run(ctx, record)
+        return True
+    except Exception as e:  # noqa: BLE001 - the data is already written; report it, do not fail the run
+        print(f"  WARNING: could not write the run log: {str(e)[:200]}", flush=True)
+        return False
 
 
 # ----------------------------------------------------------------------------- sources
@@ -198,7 +244,8 @@ def ingest_311(ctx, month, lo, hi, dry):
         return [("311", len(days), None)]
     paths = [f"{ctx.raw}/nyc311/day={d}/" for d in days]
     df = ctx.spark.read.text(paths).select(
-        F.col("value").alias("raw_json"), F.col("_metadata.file_path").alias("_source_file")
+        F.col("value").alias("raw_json"),
+        F.col("_metadata.file_path").alias("_source_file"),
     )
     rows = write_window(ctx, "311", with_day_meta(df), lib.day_predicate(lo, hi))
     return [("311", len(days), rows)]
@@ -211,18 +258,34 @@ def ingest_citibike(ctx, month, lo, hi, dry):
     results = []
     if files and not dry:
         frames = [read_csv(ctx.spark, paths) for paths in groups.values()]
-        rows = write_window(ctx, "citibike", with_day_meta(union_by_name(frames)), lib.day_predicate(lo, hi))
+        rows = write_window(
+            ctx,
+            "citibike",
+            with_day_meta(union_by_name(frames)),
+            lib.day_predicate(lo, hi),
+        )
         results.append(("citibike", len(files), rows))
     else:
         results.append(("citibike", len(files), None))
 
     # rows the extractor could not place in a day (bad or far-out dates), kept for the quality report
     if lo.day == 1:  # monthly folder: handle it once, when the window starts on the 1st
-        entries = [e for e in safe_ls(ctx.dbutils, f"{ctx.raw}/citibike/_rejected/month={month}/") if e.name.endswith(".gz")]
+        entries = [
+            e
+            for e in safe_ls(
+                ctx.dbutils, f"{ctx.raw}/citibike/_rejected/month={month}/"
+            )
+            if e.name.endswith(".gz")
+        ]
         if entries and not dry:
             by_stem = lib.group_by_stem([(None, e.path) for e in entries])
             frames = [read_csv(ctx.spark, paths) for paths in by_stem.values()]
-            rows = write_window(ctx, "citibike_rejected", with_month_meta(union_by_name(frames), month), lib.month_predicate(month))
+            rows = write_window(
+                ctx,
+                "citibike_rejected",
+                with_month_meta(union_by_name(frames), month),
+                lib.month_predicate(month),
+            )
             results.append(("citibike_rejected", len(entries), rows))
         else:
             results.append(("citibike_rejected", len(entries), None))
@@ -255,14 +318,24 @@ def ingest_tlc(ctx, month, lo, hi, dry):
             continue
         df = ctx.spark.read.parquet(*files)
         names = lib.clean_names(df.columns)
-        cols = [F.col(f"`{old}`").cast("string").alias(new) for old, new in zip(df.columns, names)]
+        cols = [
+            F.col(f"`{old}`").cast("string").alias(new)
+            for old, new in zip(df.columns, names)
+        ]
         df = df.select(*cols, F.col("_metadata.file_path").alias("_source_file"))
-        rows = write_window(ctx, f"tlc_{t}", with_month_meta(df, month), lib.month_predicate(month))
+        rows = write_window(
+            ctx, f"tlc_{t}", with_month_meta(df, month), lib.month_predicate(month)
+        )
         results.append((f"tlc_{t}", len(files), rows))
     return results
 
 
-INGEST = {"311": ingest_311, "citibike": ingest_citibike, "permits": ingest_permits, "tlc": ingest_tlc}
+INGEST = {
+    "311": ingest_311,
+    "citibike": ingest_citibike,
+    "permits": ingest_permits,
+    "tlc": ingest_tlc,
+}
 
 
 # ----------------------------------------------------------------------------- main
@@ -275,10 +348,20 @@ def parse_args(argv=None):
     p.add_argument("--end", required=True, help="last day, YYYY-MM-DD")
     p.add_argument("--sources", default="311,citibike,tlc,permits")
     p.add_argument("--bucket", default=DEFAULT_BUCKET)
-    p.add_argument("--raw-prefix", default="raw", help="use raw/test to read the tiny test data")
-    p.add_argument("--catalog", default=None, help="Unity Catalog name (default: same as --env)")
-    p.add_argument("--no-register", action="store_true", help="write Delta files only, no catalog tables")
-    p.add_argument("--dry-run", action="store_true", help="list what would be read, write nothing")
+    p.add_argument(
+        "--raw-prefix", default="raw", help="use raw/test to read the tiny test data"
+    )
+    p.add_argument(
+        "--catalog", default=None, help="Unity Catalog name (default: same as --env)"
+    )
+    p.add_argument(
+        "--no-register",
+        action="store_true",
+        help="write Delta files only, no catalog tables",
+    )
+    p.add_argument(
+        "--dry-run", action="store_true", help="list what would be read, write nothing"
+    )
     return p.parse_args(argv)
 
 
@@ -290,16 +373,25 @@ def main(argv=None):
     sources = [s.strip() for s in args.sources.split(",") if s.strip()]
     unknown = [s for s in sources if s not in INGEST]
     if unknown:
-        raise ValueError(f"unknown sources {unknown}; valid sources are {sorted(INGEST)}")
+        raise ValueError(
+            f"unknown sources {unknown}; valid sources are {sorted(INGEST)}"
+        )
 
     spark = SparkSession.builder.getOrCreate()
     ctx = Ctx(
-        spark=spark, dbutils=get_dbutils(spark), env=args.env, catalog=args.catalog or args.env,
-        bucket=args.bucket, raw_prefix=args.raw_prefix, register=not args.no_register,
+        spark=spark,
+        dbutils=get_dbutils(spark),
+        env=args.env,
+        catalog=args.catalog or args.env,
+        bucket=args.bucket,
+        raw_prefix=args.raw_prefix,
+        register=not args.no_register,
     )
-    print(f"bronze env={ctx.env} window={start}..{end} sources={sources} raw={ctx.raw} dry_run={args.dry_run}")
+    print(
+        f"bronze env={ctx.env} window={start}..{end} sources={sources} raw={ctx.raw} dry_run={args.dry_run}"
+    )
 
-    failed = []
+    failed, log_failures = [], 0
     for month in lib.months_in_window(start, end):  # month by month, as planned
         lo, hi = lib.window_for_month(month, start, end)
         for source in sources:
@@ -310,26 +402,42 @@ def main(argv=None):
             except Exception as e:  # noqa: BLE001 - record the failure, go on with the other sources
                 results, status, message = [], "FAILED", str(e)[:500]
                 failed.append(f"{source} {month}: {message}")
+            if status == "FAILED":
+                results = [(source, None, None)]
+                print(f"  {month} {source}: FAILED {message}", flush=True)
             for key, files, rows in results:
                 print(f"  {month} {key}: files={files} rows={rows}", flush=True)
-                if not args.dry_run:
-                    log_run(ctx, {
-                        "env": ctx.env, "source": key, "month": month, "window_start": lo, "window_end": hi,
-                        "files": files, "rows": rows, "status": status, "message": message,
-                        "started_at": started, "finished_at": datetime.now(UTC),
-                    })
-            if status == "FAILED":
-                print(f"  {month} {source}: FAILED {message}", flush=True)
-                if not args.dry_run:
-                    log_run(ctx, {
-                        "env": ctx.env, "source": source, "month": month, "window_start": lo, "window_end": hi,
-                        "files": None, "rows": None, "status": status, "message": message,
-                        "started_at": started, "finished_at": datetime.now(UTC),
-                    })
+                if args.dry_run:
+                    continue
+                row_status = "NO_FILES" if status == "OK" and rows is None else status
+                ok = safe_log(
+                    ctx,
+                    {
+                        "env": ctx.env,
+                        "source": key,
+                        "month": month,
+                        "window_start": lo,
+                        "window_end": hi,
+                        "files": files,
+                        "rows": rows,
+                        "status": row_status,
+                        "message": message,
+                        "started_at": started,
+                        "finished_at": datetime.now(UTC),
+                    },
+                )
+                log_failures += 0 if ok else 1
 
     if failed:
         raise RuntimeError(f"{len(failed)} unit(s) failed: " + " | ".join(failed[:5]))
-    print("bronze finished")
+    print(
+        "bronze finished"
+        + (
+            f" ({log_failures} run-log line(s) could not be written)"
+            if log_failures
+            else ""
+        )
+    )
 
 
 if __name__ == "__main__":

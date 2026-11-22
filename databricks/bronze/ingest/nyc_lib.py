@@ -80,3 +80,35 @@ def day_predicate(lo, hi):
 
 def month_predicate(month):
     return f"_month = '{month}'"
+
+
+# Columns of the bronze run log (state/bronze_run_log). Their types are spelled out because Spark
+# cannot guess the type of a column whose value is None (error CANNOT_DETERMINE_TYPE).
+LOG_FIELDS = [
+    ("env", "string"),
+    ("source", "string"),
+    ("month", "string"),
+    ("window_start", "string"),
+    ("window_end", "string"),
+    ("files", "long"),
+    ("rows", "long"),
+    ("status", "string"),
+    ("message", "string"),
+    ("started_at", "timestamp"),
+    ("finished_at", "timestamp"),
+]
+
+
+def log_tuple(record):
+    """One run-log row as a tuple in LOG_FIELDS order. None is allowed for any value."""
+    names = [name for name, _ in LOG_FIELDS]
+    extra, missing = set(record) - set(names), set(names) - set(record)
+    if extra or missing:
+        raise ValueError(
+            f"run log record: unexpected {sorted(extra)}, missing {sorted(missing)}"
+        )
+    out = []
+    for name, kind in LOG_FIELDS:
+        value = record[name]
+        out.append(str(value) if kind == "string" and value is not None else value)
+    return tuple(out)
