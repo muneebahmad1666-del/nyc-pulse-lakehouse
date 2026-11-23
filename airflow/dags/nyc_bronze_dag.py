@@ -84,6 +84,8 @@ def nyc_bronze():
     DatabricksSubmitRunOperator.partial(
         task_id="run_bronze",
         databricks_conn_id="databricks_default",
+        databricks_retry_limit=20,
+        databricks_retry_delay=30,
         polling_period_seconds=60,
         max_active_tis_per_dagrun=1,  # one chunk at a time: one cluster running, one bill
         retries=0,  # a failed chunk is fixed first, then triggered again (re-running is safe)
